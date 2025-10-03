@@ -1,0 +1,22 @@
+{
+  "assistant_name": "Jarvis",
+  "stt_model_size": "small",
+  "ai_backend": "gemini",
+  "gemini_model": "gemini-2.5-flash",
+  "max_reply_chars": 800,
+  "light_controller": "dummy",
+  "homeassistant": {
+    "base_url": "http://localhost:8123",
+    "token": "PASTE_LONG_LIVED_TOKEN",
+    "entity_id": "light.bedroom"
+  },
+  "kasa": {
+    "host": "192.168.1.50"
+  },
+  "vision": {
+    "enabled": true,
+    "camera_index": 0,
+    "top_k": 3,
+    "confidence": 0.35
+  }
+}
