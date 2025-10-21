@@ -1,6 +1,13 @@
-pip install python-dotenv google-generativeai pillow numpy sounddevice soundfile vosk openwakeword pydub
+sudo apt update
 
-python -c "import os, pathlib; from dotenv import load_dotenv; load_dotenv(pathlib.Path('~','ai-assistant','.env').expanduser()); print('Key length:', len(os.getenv('GEMINI_API_KEY','')))"
+sudo apt install -y python3-pip python3-opencv python3-numpy python3-pil python3-soundfile \
+                    ffmpeg portaudio19-dev libatlas-base-dev libsndfile1 \
+                    python3-dotenv
+
+sudo pip3 install --upgrade pip wheel setuptools
+
+sudo pip3 install vosk openwakeword pydub google-generativeai
+
 
 —------------------------------------------------------------------------------------------------------------------------
 cd ~
@@ -674,4 +681,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
