@@ -1,0 +1,206 @@
+# assistant.py
+# Complete Smart AI Assistant for Raspberry Pi 4B
+# Wake word, offline STT, vision, Gemini API, Piper TTS (male Ryan voice)
+
+import os, io, time, queue, wave, subprocess, json, sys
+from pathlib import Path
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+from openwakeword import Model as WakeModel
+from vosk import Model as VoskModel, KaldiRecognizer
+import cv2
+from PIL import Image
+import google.generativeai as genai
+
+# ---------- ENV SETUP ----------
+BASE = Path(__file__).resolve().parent
+ENV_PATH = BASE / ".env"
+
+print("DEBUG: python exe   ->", sys.executable)
+print("DEBUG: script dir   ->", BASE)
+print("DEBUG: looking for  ->", ENV_PATH)
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    raise RuntimeError(
+        "python-dotenv missing. Run: source .venv/bin/activate && pip install python-dotenv"
+    )
+
+loaded = load_dotenv(ENV_PATH)
+print("DEBUG: dotenv loaded?", loaded)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+print("DEBUG: key length    ->", len(GEMINI_API_KEY or ""))
+
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        f"API key not found. Create ~/ai-assistant/.env with:\n"
+        f"GEMINI_API_KEY=YOUR_REAL_KEY_HERE\nPIPER_VOICE=en_US-ryan-high\n"
+    )
+
+PIPER_VOICE = os.getenv("PIPER_VOICE", "en_US-ryan-high")
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------- PATHS ----------
+MODEL_DIR = BASE / "models" / "vosk-en"
+VOICE_DIR = BASE / "voices"
+TMP_DIR = BASE / "tmp"
+TMP_DIR.mkdir(exist_ok=True)
+
+# ---------- AUDIO CONFIG ----------
+SAMPLE_RATE = 16000
+CHANNELS = 1
+BLOCK_SIZE = 1024
+wake = WakeModel()
+WAKE_THRESHOLD = 0.45
+
+if not MODEL_DIR.exists():
+    raise RuntimeError(f"Vosk model not found: {MODEL_DIR}")
+
+vosk_model = VoskModel(str(MODEL_DIR))
+recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+recognizer.SetWords(True)
+
+# ---------- CAMERA ----------
+USE_PICAMERA2 = False
+try:
+    from picamera2 import Picamera2
+    picam2 = Picamera2()
+    picam2.configure(picam2.create_still_configuration(main={"size": (1280, 720)}))
+    picam2.start()
+    USE_PICAMERA2 = True
+    print("[Camera] Using Picamera2")
+except Exception as e:
+    print("[Camera] Picamera2 unavailable:", e)
+    cap = cv2.VideoCapture(0)
+    if cap.isOpened():
+        print("[Camera] Using OpenCV VideoCapture(0)")
+    else:
+        print("[Camera] No camera detected")
+        cap = None
+
+# ---------- TTS (Piper) ----------
+def speak_tts(text):
+    if not text:
+        return
+    wav = TMP_DIR / f"tts_{int(time.time()*1000)}.wav"
+    model = VOICE_DIR / f"{PIPER_VOICE}.onnx"
+    cfg = VOICE_DIR / f"{PIPER_VOICE}.onnx.json"
+    if not model.exists() or not cfg.exists():
+        raise FileNotFoundError(
+            f"Piper voice not found. Expected:\n{model}\n{cfg}\n"
+            "Download Ryan voice into ~/ai-assistant/voices/"
+        )
+    cmd = ["piper", "--model", str(model), "--config", str(cfg), "--output_file", str(wav)]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    p.communicate(input=text.encode())
+    p.wait()
+    subprocess.run(["aplay", "-q", str(wav)], check=False)
+    try: wav.unlink()
+    except: pass
+
+# ---------- MIC STREAM ----------
+audio_q = queue.Queue()
+def mic_callback(indata, frames, time_info, status):
+    audio_q.put(indata.copy())
+def start_mic_stream():
+    return sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS,
+        dtype="float32", blocksize=BLOCK_SIZE, callback=mic_callback
+    )
+
+# ---------- FUNCTIONS ----------
+def detect_wake_word():
+    while True:
+        block = audio_q.get()
+        scores = wake.predict(block)
+        if not scores: continue
+        _, s = max(scores.items(), key=lambda x: x[1])
+        if s >= WAKE_THRESHOLD: return
+
+def record_until_silence(max_seconds=8, silence_ms=900, thresh=0.01):
+    frames, silent_for, start = [], 0.0, time.time()
+    ms_per_block = 1000.0 * (BLOCK_SIZE / SAMPLE_RATE)
+    while True:
+        try: block = audio_q.get(timeout=2.0)
+        except queue.Empty: break
+        frames.append(block)
+        energy = np.mean(np.abs(block))
+        silent_for = silent_for + ms_per_block if energy < thresh else 0
+        if silent_for >= silence_ms or (time.time() - start) > max_seconds:
+            break
+    if not frames: return None
+    data = np.concatenate(frames, axis=0)
+    out = TMP_DIR / f"rec_{int(time.time()*1000)}.wav"
+    sf.write(str(out), data, SAMPLE_RATE, subtype="PCM_16")
+    return out
+
+def transcribe(wav):
+    with wave.open(str(wav), "rb") as wf:
+        recognizer.Reset()
+        while True:
+            d = wf.readframes(4000)
+            if not d: break
+            recognizer.AcceptWaveform(d)
+        res = json.loads(recognizer.FinalResult())
+        return res.get("text", "").strip()
+
+def capture_image():
+    if USE_PICAMERA2:
+        frame = picam2.capture_array()
+    elif cap:
+        ok, frame = cap.read()
+        if not ok: raise RuntimeError("Camera read error")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    else:
+        raise RuntimeError("No camera available")
+    return Image.fromarray(frame)
+
+def ask_gemini(prompt):
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    r = model.generate_content(prompt, safety_settings=None)
+    return (r.text or "").strip()
+
+def describe_image(img):
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    r = model.generate_content(["Describe the scene clearly.", img], safety_settings=None)
+    return (r.text or "").strip()
+
+def route(cmd):
+    txt = cmd.lower()
+    if "what do you see" in txt or "describe" in txt:
+        try: return describe_image(capture_image())
+        except Exception as e: return f"Camera issue: {e}"
+    return ask_gemini(f"You are a helpful smart room assistant. User said: {cmd}")
+
+# ---------- MAIN LOOP ----------
+def main():
+    print("Mic starting… (Ctrl+C to stop)")
+    with start_mic_stream():
+        speak_tts("Assistant ready. Say 'Hey Jarvis' to start.")
+        while True:
+            try:
+                detect_wake_word()
+                speak_tts("Yes?")
+                wav = record_until_silence()
+                if not wav: continue
+                text = transcribe(wav)
+                try: wav.unlink()
+                except: pass
+                if not text: continue
+                print("[You]:", text)
+                ans = route(text)
+                print("[AI]:", ans)
+                speak_tts(ans)
+            except KeyboardInterrupt:
+                print("Goodbye!")
+                break
+            except Exception as e:
+                print("Error:", e)
+                speak_tts("Error occurred.")
+                time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()
