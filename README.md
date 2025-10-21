@@ -1,13 +1,6 @@
-sudo dpkg --configure -a
-sudo apt --fix-broken install -y
-sudo apt update
-python -c "import os, pathlib; from dotenv import load_dotenv; load_dotenv(pathlib.Path('~','ai-assistant','.env').expanduser()); print('Key length:', len(os.getenv('GEMINI_API_KEY','') or os.getenv('GOOGLE_API_KEY','')))"
-sudo apt install -y python3-venv python3-pip portaudio19-dev ffmpeg git curl
-# (Nice-to-have BLAS, skip if not found)
-sudo apt install -y libatlas-base-dev || sudo apt install -y libopenblas-dev || true
+pip install python-dotenv google-generativeai pillow numpy sounddevice soundfile vosk openwakeword pydub
 
-# Camera stack (works on Raspberry Pi OS Bookworm; skip if not found)
-sudo apt install -y python3-picamera2 libcamera-apps || true
+python -c "import os, pathlib; from dotenv import load_dotenv; load_dotenv(pathlib.Path('~','ai-assistant','.env').expanduser()); print('Key length:', len(os.getenv('GEMINI_API_KEY','')))"
 
 —------------------------------------------------------------------------------------------------------------------------
 cd ~
@@ -681,3 +674,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
