@@ -342,4 +342,344 @@ pip install picamera2
 pip install pillow
 
 pip install google-generativeai
+---------------------------------------------------------------
+# assistant.py
+# Full, robust AI assistant for Raspberry Pi 4B
+# - Wake word via openwakeword ("hey jarvis")
+# - Offline STT via Vosk
+# - Vision Q&A via Gemini (uses your GEMINI_API_KEY / GOOGLE_API_KEY)
+# - TTS via Piper (default male voice: en_US-ryan-high)
+# - Camera: Picamera2 if available, else OpenCV fallback
+# - Plays audio via aplay (ALSA)
+
+import os, io, time, queue, threading, wave, subprocess, json, sys
+from pathlib import Path
+from datetime import datetime
+
+# ---------- Paths & .env (force-load from script directory) ----------
+BASE = Path(__file__).resolve().parent
+from dotenv import load_dotenv
+load_dotenv(BASE / ".env")
+
+# Accept either name; some docs say GOOGLE_API_KEY
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "API key not found.\nCreate ~/ai-assistant/.env with:\n"
+        "GEMINI_API_KEY=YOUR_REAL_KEY_HERE\n"
+        "PIPER_VOICE=en_US-ryan-high"
+    )
+
+# Optional voice override via .env (defaults to male 'ryan')
+PIPER_VOICE_NAME = os.getenv("PIPER_VOICE", "en_US-ryan-high")
+
+# ---------- Audio ----------
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
+
+# ---------- Wake Word (local) ----------
+from openwakeword import Model as WakeModel
+
+# ---------- STT (offline) ----------
+from vosk import Model as VoskModel, KaldiRecognizer
+
+# ---------- Vision (Picamera2 if available, else OpenCV) ----------
+import cv2
+from PIL import Image
+
+USE_PICAMERA2 = False
+try:
+    from picamera2 import Picamera2  # will not exist on Ubuntu unless installed
+    USE_PICAMERA2 = True
+except Exception:
+    USE_PICAMERA2 = False
+
+# ---------- Gemini ----------
+import google.generativeai as genai
+genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL_TEXT = "gemini-1.5-flash"
+GEMINI_MODEL_VISION = "gemini-1.5-flash"
+
+# ---------- Folders ----------
+MODEL_DIR = BASE / "models" / "vosk-en"
+VOICE_DIR = BASE / "voices"
+TMP_DIR = BASE / "tmp"
+TMP_DIR.mkdir(exist_ok=True)
+
+# ---------- TTS: Piper helper ----------
+def speak_tts(text: str):
+    """
+    Use Piper CLI to synthesize speech and play it.
+    Voice is controlled by PIPER_VOICE in .env (default: en_US-ryan-high).
+    """
+    if not text:
+        return
+    voice = VOICE_DIR / f"{PIPER_VOICE_NAME}.onnx"
+    voice_cfg = VOICE_DIR / f"{PIPER_VOICE_NAME}.onnx.json"
+    if not voice.exists() or not voice_cfg.exists():
+        raise FileNotFoundError(
+            f"Piper voice missing.\nExpected:\n  {voice}\n  {voice_cfg}\n"
+            "Download Ryan voice into ~/ai-assistant/voices/"
+        )
+    wav_path = TMP_DIR / f"tts_{int(time.time()*1000)}.wav"
+
+    cmd = [
+        "piper",
+        "--model", str(voice),
+        "--config", str(voice_cfg),
+        "--output_file", str(wav_path)
+    ]
+    # Piper reads text from stdin
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    p.communicate(input=text.encode("utf-8"))
+    p.wait()
+
+    # Play with ALSA
+    subprocess.run(["aplay", "-q", str(wav_path)], check=False)
+    try:
+        wav_path.unlink()
+    except Exception:
+        pass
+
+# ---------- Mic stream config ----------
+SAMPLE_RATE = 16000
+CHANNELS = 1
+BLOCK_SIZE = 1024
+
+# ---------- Wake word ----------
+wake = WakeModel()  # default bundle includes "hey jarvis"
+WAKEWORD = "hey jarvis"
+WAKE_THRESHOLD = 0.45  # lower = more sensitive
+
+# ---------- Vosk STT ----------
+if not MODEL_DIR.exists():
+    raise RuntimeError(
+        f"Vosk model not found at {MODEL_DIR}\n"
+        "Download small EN model and unpack to models/vosk-en/"
+    )
+vosk_model = VoskModel(str(MODEL_DIR))
+recognizer = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+recognizer.SetWords(True)
+
+# ---------- Camera setup ----------
+picam2 = None
+cap = None
+
+if USE_PICAMERA2:
+    try:
+        picam2 = Picamera2()
+        picam2.configure(picam2.create_still_configuration(main={"size": (1280, 720)}))
+        picam2.start()
+        print("[Camera] Using Picamera2")
+    except Exception as e:
+        print("[Camera] Picamera2 failed, falling back to OpenCV:", e)
+        USE_PICAMERA2 = False
+
+if not USE_PICAMERA2:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[Camera] OpenCV could not open /dev/video0")
+        print("         If you have a Raspberry Pi Camera, install picamera2 via apt and reboot.")
+        # We won't crash here; just handle gracefully when called.
+    else:
+        print("[Camera] Using OpenCV VideoCapture(0)")
+
+def capture_image() -> Image.Image:
+    """
+    Returns a PIL.Image from the active camera.
+    """
+    if USE_PICAMERA2 and picam2 is not None:
+        frame = picam2.capture_array()  # RGB ndarray
+        return Image.fromarray(frame)
+    if cap is not None and cap.isOpened():
+        ok, frame = cap.read()
+        if not ok:
+            raise RuntimeError("Camera capture failed (OpenCV).")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame)
+    raise RuntimeError("No camera available. (Neither Picamera2 nor OpenCV capture is working.)")
+
+# ---------- Audio queues ----------
+audio_q = queue.Queue()
+
+def mic_callback(indata, frames, time_info, status):
+    if status:
+        # print(status)
+        pass
+    audio_q.put(indata.copy())
+    return None
+
+def start_mic_stream():
+    return sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="float32",
+        blocksize=BLOCK_SIZE,
+        callback=mic_callback,
+        device=None  # default device
+    )
+
+def detect_wake_word():
+    """
+    Continuously read mic data and run wakeword detection.
+    Returns when wake word fires.
+    """
+    while True:
+        block = audio_q.get()
+        scores = wake.predict(block)
+        if not scores:
+            continue
+        # Top keyword score
+        _, score = max(scores.items(), key=lambda x: x[1])
+        if score >= WAKE_THRESHOLD:
+            return
+
+def record_until_silence(max_seconds=8, silence_ms=900, thresh=0.01):
+    """
+    Record user speech after wake word until silence.
+    Returns path to WAV (16kHz mono).
+    """
+    frames = []
+    start_time = time.time()
+    silent_for = 0.0
+    ms_per_block = 1000.0 * (BLOCK_SIZE / SAMPLE_RATE)
+
+    while True:
+        try:
+            block = audio_q.get(timeout=2.0)
+        except queue.Empty:
+            break
+        frames.append(block)
+        energy = np.mean(np.abs(block))
+        if energy < thresh:
+            silent_for += ms_per_block
+        else:
+            silent_for = 0.0
+
+        if silent_for >= silence_ms or (time.time() - start_time) > max_seconds:
+            break
+
+    if not frames:
+        return None
+
+    data = np.concatenate(frames, axis=0)
+    wav_path = TMP_DIR / f"rec_{int(time.time()*1000)}.wav"
+    sf.write(str(wav_path), data, SAMPLE_RATE, subtype="PCM_16")
+    return wav_path
+
+def transcribe_vosk(wav_path: Path) -> str:
+    with wave.open(str(wav_path), "rb") as wf:
+        recognizer.Reset()
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            recognizer.AcceptWaveform(data)
+        try:
+            res = json.loads(recognizer.FinalResult())
+            return (res.get("text") or "").strip()
+        except Exception:
+            return ""
+
+def ask_gemini_text(prompt: str) -> str:
+    model = genai.GenerativeModel(GEMINI_MODEL_TEXT)
+    resp = model.generate_content(prompt, safety_settings=None)
+    return (getattr(resp, "text", None) or "").strip()
+
+def describe_image_with_gemini(img: Image.Image, user_prompt: str = "Describe what you see in detail."):
+    model = genai.GenerativeModel(GEMINI_MODEL_VISION)
+    resp = model.generate_content([user_prompt, img], safety_settings=None)
+    return (getattr(resp, "text", None) or "").strip()
+
+def route_command(cmd_text: str) -> str:
+    """
+    Expand here for smart devices (GPIO/Home Assistant, plugs, etc.).
+    """
+    txt = cmd_text.lower().strip()
+    if any(k in txt for k in [
+        "what do you see", "what do you see?",
+        "what's in front", "what do i look like",
+        "describe the room"
+    ]):
+        try:
+            img = capture_image()
+            return describe_image_with_gemini(
+                img,
+                "Describe the scene concisely like a smart home assistant. Mention objects and their positions."
+            )
+        except Exception as e:
+            return f"I couldn't access the camera: {e}"
+
+    # Default: send to Gemini as a voice assistant
+    return ask_gemini_text(
+        f"You are a friendly, concise smart-room voice assistant. Respond for speech.\nUser: {cmd_text}"
+    )
+
+def main():
+    print("Starting mic… (Ctrl+C to stop)")
+    # Warm greet after audio stream starts
+    with start_mic_stream():
+        try:
+            speak_tts("Assistant ready. Say 'Hey Jarvis' to start.")
+        except Exception as e:
+            print("[TTS] Could not speak:", e)
+
+        while True:
+            try:
+                # 1) Wait for wake word
+                detect_wake_word()
+                try:
+                    speak_tts("Yes?")
+                except Exception as e:
+                    print("[TTS] Could not speak:", e)
+
+                # 2) Record command
+                wav_path = record_until_silence()
+                if not wav_path:
+                    speak_tts("Sorry, I didn't catch that.")
+                    continue
+
+                # 3) STT
+                text = transcribe_vosk(wav_path)
+                try:
+                    wav_path.unlink()
+                except Exception:
+                    pass
+                if not text:
+                    speak_tts("Sorry, I didn't hear anything.")
+                    continue
+
+                print(f"[You]: {text}")
+
+                # 4) Route → Gemini / Vision
+                reply = route_command(text)
+                print(f"[Assistant]: {reply}")
+
+                # 5) TTS back
+                speak_tts(reply)
+
+            except KeyboardInterrupt:
+                print("\nGoodbye!")
+                break
+            except Exception as e:
+                print("[Main Loop Error]:", e)
+                try:
+                    speak_tts("An error occurred.")
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+    # Cleanup
+    try:
+        if USE_PICAMERA2 and picam2 is not None:
+            picam2.stop()
+        if not USE_PICAMERA2 and cap is not None:
+            cap.release()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()
+
 
