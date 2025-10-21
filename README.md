@@ -1,8 +1,9 @@
 sudo apt update
 
-sudo apt install -y python3-pip python3-opencv python3-numpy python3-pil python3-soundfile \
-                    ffmpeg portaudio19-dev liblapack-dev libblas-dev libsndfile1 \
-                    python3-dotenv
+sudo apt install -y python3-pip python3-opencv python3-numpy ffmpeg
+sudo apt install -y portaudio19-dev liblapack-dev libblas-dev libsndfile1
+sudo apt install -y python3-pil python3-soundfile python3-dotenv
+
 
 sudo pip3 install --upgrade pip wheel setuptools
 
@@ -681,6 +682,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
