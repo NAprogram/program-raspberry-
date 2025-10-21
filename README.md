@@ -325,3 +325,20 @@ python assistant.py
 
 —------------------------------------------------------------------------------------------------------
 
+pip install python-dotenv
+
+pip install sounddevice
+
+pip install soundfile
+
+pip install numpy
+
+pip install openwakeword
+
+pip install vosk
+
+pip install picamera2
+
+pip install pillow
+
+pip install google-generativeai
